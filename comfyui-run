@@ -2,5 +2,5 @@
 cd /home/jovyan/ComfyUI
 exec 2>&1
 
-# Run the ComfyUI Kubeflow adapter
-exec python comfyui-kubeflow-adapter.py
+# Run ComfyUI directly with port and CORS settings
+exec python main.py --listen 0.0.0.0 --port 8888 --enable-cors-header "*"
