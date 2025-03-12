@@ -22,6 +22,7 @@ NB_PREFIX = os.environ.get('NB_PREFIX', '')
 logger.info(f"Starting ComfyUI with Kubeflow prefix: {NB_PREFIX}")
 
 COMFY_DIR = os.path.expanduser("~/ComfyUI")
+KUBEFLOW_PORT = 8888  # Kubeflow uses 8888
 
 def patch_comfyui_server():
     """
@@ -92,6 +93,12 @@ def patch_comfyui_server():
             "await self.send(\"status\", { \"status\": self.get_queue_info(), 'sid': sid, 'prefix': NB_PREFIX }, sid)"
         )
         
+        # Fix the address print line for the log message
+        content = content.replace(
+            'logging.info("To see the GUI go to: {}://{}:{}".format(scheme, address_print, port))',
+            f'logging.info("To see the GUI go to Kubeflow UI and open the notebook server with prefix: " + NB_PREFIX)'
+        )
+        
         # Write patched content back
         with open(server_path, 'w') as file:
             file.write(content)
@@ -140,30 +147,6 @@ def patch_comfyui_server():
         logger.error(f"Failed to patch ComfyUI server.py: {str(e)}")
         return False
 
-def modify_port():
-    """
-    Modify ComfyUI to use port 8888 instead of 8188
-    """
-    try:
-        main_path = os.path.join(COMFY_DIR, "main.py")
-        with open(main_path, 'r') as file:
-            content = file.read()
-        
-        # Change default port
-        modified_content = content.replace(
-            'parser.add_argument("--port", type=int, default=8188,',
-            'parser.add_argument("--port", type=int, default=8888,'
-        )
-        
-        with open(main_path, 'w') as file:
-            file.write(modified_content)
-        
-        logger.info("Modified main.py to use port 8888")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to modify port in main.py: {str(e)}")
-        return False
-
 def start_comfyui():
     """
     Start ComfyUI after patching
@@ -172,13 +155,13 @@ def start_comfyui():
         # Change to ComfyUI directory
         os.chdir(COMFY_DIR)
         
-        # Start ComfyUI with modified parameters
-        cmd = [sys.executable, "main.py", "--listen", "0.0.0.0"]
+        # Start ComfyUI with explicit port parameter
+        cmd = [sys.executable, "main.py", "--listen", "0.0.0.0", "--port", str(KUBEFLOW_PORT)]
         
         logger.info(f"Starting ComfyUI with command: {' '.join(cmd)}")
         
         # Execute ComfyUI directly (this will replace the current process)
-        os.execv(sys.executable, [sys.executable] + ["main.py", "--listen", "0.0.0.0"])
+        os.execv(sys.executable, [sys.executable] + ["main.py", "--listen", "0.0.0.0", "--port", str(KUBEFLOW_PORT)])
         
         # This line will never be reached because execv replaces the current process
         return True
@@ -199,11 +182,7 @@ if __name__ == "__main__":
         logger.error("Failed to patch ComfyUI server")
         sys.exit(1)
     
-    if not modify_port():
-        logger.warning("Failed to modify port in main.py")
-        # Continue anyway, might still work with arguments
-    
-    # Start ComfyUI
+    # Start ComfyUI with explicit port
     start_comfyui()
     # If we get here, something went wrong
     logger.error("Failed to start ComfyUI")
