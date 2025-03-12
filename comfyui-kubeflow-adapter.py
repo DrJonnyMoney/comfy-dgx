@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-ComfyUI Kubeflow Adapter
+ComfyUI Kubeflow Adapter with specific fix for else statement indentation
 
 This script serves as an adapter between Kubeflow's URL structure and ComfyUI.
-It modifies ComfyUI's server.py to work with Kubeflow's URL prefix system
-and addresses security restrictions.
+It modifies ComfyUI's server.py to work with Kubeflow's URL prefix system.
 """
 
 import os
 import sys
 import shutil
 import logging
-import subprocess
+import re
+import time
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, 
@@ -27,7 +27,7 @@ KUBEFLOW_PORT = 8888  # Kubeflow uses 8888
 
 def patch_comfyui_server():
     """
-    Patch ComfyUI's server.py to work with Kubeflow URL prefix and security settings
+    Patch ComfyUI's server.py to work with Kubeflow URL prefix
     """
     try:
         server_path = os.path.join(COMFY_DIR, "server.py")
@@ -40,87 +40,67 @@ def patch_comfyui_server():
             # Reset to original for clean patching
             logger.info("Restoring original server.py for clean patching")
             shutil.copy2(backup_path, server_path)
+            time.sleep(0.5)  # Give time for the file system to process
         
+        # Process the file line by line to ensure indentation is correct
         with open(server_path, 'r') as file:
-            content = file.read()
+            lines = file.readlines()
         
-        # Add NB_PREFIX as a global variable at the top of the file
-        if "NB_PREFIX = os.environ.get('NB_PREFIX', '')" not in content:
-            content = "import os\nimport sys\nimport asyncio\nimport traceback\n\n# Kubeflow integration\nNB_PREFIX = os.environ.get('NB_PREFIX', '')\n" + content[content.find("import os\n") + len("import os\n"):]
+        # Add NB_PREFIX variable at the top of the file
+        for i, line in enumerate(lines):
+            if line.strip() == 'import os':
+                lines.insert(i + 4, '\n# Kubeflow integration\nNB_PREFIX = os.environ.get(\'NB_PREFIX\', \'\')\n')
+                break
         
-        # More careful CORS settings modification - maintaining indentation
-        if "create_cors_middleware" in content:
-            # For origin_only_middleware, we need to be careful about indentation
-            # Find the origin_only_middleware creation and just comment it out without changing indentation
-            lines = content.split('\n')
-            for i, line in enumerate(lines):
-                if "middlewares.append(create_origin_only_middleware())" in line:
-                    indent = line[:len(line) - len(line.lstrip())]
-                    lines[i] = f"{indent}# Disabled for Kubeflow compatibility\n{indent}# {line.lstrip()}"
-                elif "if args.enable_cors_header:" in line:
-                    indent = line[:len(line) - len(line.lstrip())]
-                    lines[i] = f"{indent}# Always enable CORS for Kubeflow\n{indent}if True:"
-                elif "if host_domain != origin_domain:" in line:
-                    indent = line[:len(line) - len(line.lstrip())]
-                    lines[i] = f"{indent}if False:  # Disabled for Kubeflow compatibility"
+        # Patch routes and other elements
+        for i, line in enumerate(lines):
+            # Route patching
+            route_match = re.match(r'(\s*)@routes\.(get|post)\([\'"]/(.*?)[\'"]\)', line)
+            if route_match:
+                indent, method, path = route_match.groups()
+                if '{' in path:  # Handle routes with parameters
+                    new_path = path.replace('{', '{{').replace('}', '}}')
+                    lines[i] = f"{indent}@routes.{method}(NB_PREFIX + '/{new_path}')\n"
+                else:
+                    lines[i] = f"{indent}@routes.{method}(NB_PREFIX + '/{path}')\n"
             
-            content = '\n'.join(lines)
+            # Fix static routes
+            elif "web.static('/', self.web_root)" in line:
+                indent = line[:len(line) - len(line.lstrip())]
+                lines[i] = f"{indent}web.static(NB_PREFIX + '/', self.web_root)\n"
+            
+            elif "web.static('/extensions/' + name, dir)" in line:
+                indent = line[:len(line) - len(line.lstrip())]
+                lines[i] = f"{indent}web.static(NB_PREFIX + '/extensions/' + name, dir)\n"
+            
+            # Disable host validation without changing indentation structure
+            elif "if host_domain != origin_domain:" in line:
+                indent = line[:len(line) - len(line.lstrip())]
+                lines[i] = f"{indent}if False:  # Disabled for Kubeflow compat - host_domain != origin_domain\n"
+            
+            # CORS middleware - ensure if/else structure is preserved
+            elif "if args.enable_cors_header:" in line:
+                indent = line[:len(line) - len(line.lstrip())]
+                lines[i] = f"{indent}if True:  # Always enable CORS for Kubeflow\n"
+            
+            # Disable origin_only_middleware without affecting structure
+            elif "middlewares.append(create_origin_only_middleware())" in line:
+                indent = line[:len(line) - len(line.lstrip())]
+                lines[i] = f"{indent}# middlewares.append(create_origin_only_middleware())  # Disabled for Kubeflow\n"
+            
+            # Update WebSocket response
+            elif "await self.send(\"status\", { \"status\": self.get_queue_info(), 'sid': sid }, sid)" in line:
+                indent = line[:len(line) - len(line.lstrip())]
+                lines[i] = f"{indent}await self.send(\"status\", {{ \"status\": self.get_queue_info(), 'sid': sid, 'prefix': NB_PREFIX }}, sid)\n"
+            
+            # Update log message
+            elif "logging.info(\"To see the GUI go to:" in line:
+                indent = line[:len(line) - len(line.lstrip())]
+                lines[i] = f"{indent}logging.info(\"To see the GUI go to Kubeflow UI and open the notebook server with prefix: \" + NB_PREFIX)\n"
         
-        # Patch routes one by one to maintain correct patterns
-        routes_to_patch = [
-            ("@routes.get('/ws')", f"@routes.get(NB_PREFIX + '/ws')"),
-            ("@routes.get('/')", f"@routes.get(NB_PREFIX + '/')"),
-            ("@routes.get('/embeddings')", f"@routes.get(NB_PREFIX + '/embeddings')"),
-            ("@routes.get('/models')", f"@routes.get(NB_PREFIX + '/models')"),
-            ("@routes.get('/models/{folder}')", f"@routes.get(NB_PREFIX + '/models/{{folder}}')"),
-            ("@routes.get('/extensions')", f"@routes.get(NB_PREFIX + '/extensions')"),
-            ("@routes.post('/upload/image')", f"@routes.post(NB_PREFIX + '/upload/image')"),
-            ("@routes.post('/upload/mask')", f"@routes.post(NB_PREFIX + '/upload/mask')"),
-            ("@routes.get('/view')", f"@routes.get(NB_PREFIX + '/view')"),
-            ("@routes.get('/view_metadata/{folder_name}')", f"@routes.get(NB_PREFIX + '/view_metadata/{{folder_name}}')"),
-            ("@routes.get('/system_stats')", f"@routes.get(NB_PREFIX + '/system_stats')"),
-            ("@routes.get('/prompt')", f"@routes.get(NB_PREFIX + '/prompt')"),
-            ("@routes.get('/object_info')", f"@routes.get(NB_PREFIX + '/object_info')"),
-            ("@routes.get('/object_info/{node_class}')", f"@routes.get(NB_PREFIX + '/object_info/{{node_class}}')"),
-            ("@routes.get('/history')", f"@routes.get(NB_PREFIX + '/history')"),
-            ("@routes.get('/history/{prompt_id}')", f"@routes.get(NB_PREFIX + '/history/{{prompt_id}}')"),
-            ("@routes.get('/queue')", f"@routes.get(NB_PREFIX + '/queue')"),
-            ("@routes.post('/prompt')", f"@routes.post(NB_PREFIX + '/prompt')"),
-            ("@routes.post('/queue')", f"@routes.post(NB_PREFIX + '/queue')"),
-            ("@routes.post('/interrupt')", f"@routes.post(NB_PREFIX + '/interrupt')"),
-            ("@routes.post('/free')", f"@routes.post(NB_PREFIX + '/free')"),
-            ("@routes.post('/history')", f"@routes.post(NB_PREFIX + '/history')")
-        ]
-        
-        for old, new in routes_to_patch:
-            content = content.replace(old, new)
-        
-        # Fix static routes
-        content = content.replace(
-            "web.static('/', self.web_root)",
-            f"web.static(NB_PREFIX + '/', self.web_root)"
-        )
-        
-        content = content.replace(
-            "web.static('/extensions/' + name, dir)",
-            f"web.static(NB_PREFIX + '/extensions/' + name, dir)"
-        )
-        
-        # Add prefix to websocket response
-        content = content.replace(
-            "await self.send(\"status\", { \"status\": self.get_queue_info(), 'sid': sid }, sid)",
-            "await self.send(\"status\", { \"status\": self.get_queue_info(), 'sid': sid, 'prefix': NB_PREFIX }, sid)"
-        )
-        
-        # Fix the address print line for the log message
-        content = content.replace(
-            'logging.info("To see the GUI go to: {}://{}:{}".format(scheme, address_print, port))',
-            f'logging.info("To see the GUI go to Kubeflow UI and open the notebook server with prefix: " + NB_PREFIX)'
-        )
-        
-        # Write patched content back
+        # Save the patched file
         with open(server_path, 'w') as file:
-            file.write(content)
+            file.writelines(lines)
         
         # Patch index.html to include prefix
         index_path = os.path.join(COMFY_DIR, "web", "index.html")
@@ -166,6 +146,30 @@ def patch_comfyui_server():
         logger.error(f"Failed to patch ComfyUI server.py: {str(e)}")
         return False
 
+def modify_port():
+    """
+    Modify ComfyUI to use port 8888 instead of 8188
+    """
+    try:
+        main_path = os.path.join(COMFY_DIR, "main.py")
+        with open(main_path, 'r') as file:
+            content = file.read()
+        
+        # Change default port
+        modified_content = content.replace(
+            'parser.add_argument("--port", type=int, default=8188,',
+            'parser.add_argument("--port", type=int, default=8888,'
+        )
+        
+        with open(main_path, 'w') as file:
+            file.write(modified_content)
+        
+        logger.info("Modified main.py to use port 8888")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to modify port in main.py: {str(e)}")
+        return False
+
 def start_comfyui():
     """
     Start ComfyUI after patching
@@ -186,7 +190,7 @@ def start_comfyui():
         logger.info(f"Starting ComfyUI with command: {' '.join(cmd)}")
         
         # Execute ComfyUI directly (this will replace the current process)
-        os.execv(sys.executable, cmd)
+        os.execv(sys.executable, [sys.executable] + cmd[1:])
         
         # This line will never be reached because execv replaces the current process
         return True
@@ -206,6 +210,10 @@ if __name__ == "__main__":
     if not patch_comfyui_server():
         logger.error("Failed to patch ComfyUI server")
         sys.exit(1)
+    
+    if not modify_port():
+        logger.warning("Failed to modify port in main.py")
+        # Continue anyway as we'll specify port on command line
     
     # Start ComfyUI with explicit port and security settings
     start_comfyui()
