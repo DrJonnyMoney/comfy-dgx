@@ -2,5 +2,5 @@
 cd /home/jovyan/ComfyUI
 exec 2>&1
 
-# Run the ComfyUI starter script
-exec python comfyui-start.py
+# Run the ComfyUI Kubeflow adapter
+exec python comfyui-kubeflow-adapter.py
