@@ -11,7 +11,6 @@ import sys
 import shutil
 import logging
 import subprocess
-import re
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, 
@@ -43,122 +42,102 @@ def patch_comfyui_server():
         with open(server_path, 'r') as file:
             content = file.read()
         
-        # Inject NB_PREFIX into the server code
-        patched_content = content.replace(
-            "class PromptServer():",
-            "class PromptServer():\n    NB_PREFIX = os.environ.get('NB_PREFIX', '')"
-        )
+        # Add NB_PREFIX as a global variable at the top of the file
+        if "NB_PREFIX = os.environ.get('NB_PREFIX', '')" not in content:
+            content = "import os\nimport sys\nimport asyncio\nimport traceback\n\n# Kubeflow integration\nNB_PREFIX = os.environ.get('NB_PREFIX', '')\n" + content[content.find("import os\n") + len("import os\n"):]
+            
+        # Patch routes one by one manually instead of using regex
+        replacements = [
+            ("@routes.get('/ws')", f"@routes.get(NB_PREFIX + '/ws')"),
+            ("@routes.get('/')", f"@routes.get(NB_PREFIX + '/')"),
+            ("@routes.get('/embeddings')", f"@routes.get(NB_PREFIX + '/embeddings')"),
+            ("@routes.get('/models')", f"@routes.get(NB_PREFIX + '/models')"),
+            ("@routes.get('/models/{folder}')", f"@routes.get(NB_PREFIX + '/models/{{folder}}')"),
+            ("@routes.get('/extensions')", f"@routes.get(NB_PREFIX + '/extensions')"),
+            ("@routes.post('/upload/image')", f"@routes.post(NB_PREFIX + '/upload/image')"),
+            ("@routes.post('/upload/mask')", f"@routes.post(NB_PREFIX + '/upload/mask')"),
+            ("@routes.get('/view')", f"@routes.get(NB_PREFIX + '/view')"),
+            ("@routes.get('/view_metadata/{folder_name}')", f"@routes.get(NB_PREFIX + '/view_metadata/{{folder_name}}')"),
+            ("@routes.get('/system_stats')", f"@routes.get(NB_PREFIX + '/system_stats')"),
+            ("@routes.get('/prompt')", f"@routes.get(NB_PREFIX + '/prompt')"),
+            ("@routes.get('/object_info')", f"@routes.get(NB_PREFIX + '/object_info')"),
+            ("@routes.get('/object_info/{node_class}')", f"@routes.get(NB_PREFIX + '/object_info/{{node_class}}')"),
+            ("@routes.get('/history')", f"@routes.get(NB_PREFIX + '/history')"),
+            ("@routes.get('/history/{prompt_id}')", f"@routes.get(NB_PREFIX + '/history/{{prompt_id}}')"),
+            ("@routes.get('/queue')", f"@routes.get(NB_PREFIX + '/queue')"),
+            ("@routes.post('/prompt')", f"@routes.post(NB_PREFIX + '/prompt')"),
+            ("@routes.post('/queue')", f"@routes.post(NB_PREFIX + '/queue')"),
+            ("@routes.post('/interrupt')", f"@routes.post(NB_PREFIX + '/interrupt')"),
+            ("@routes.post('/free')", f"@routes.post(NB_PREFIX + '/free')"),
+            ("@routes.post('/history')", f"@routes.post(NB_PREFIX + '/history')")
+        ]
         
-        # Patch web routes to include prefix
-        patched_content = patched_content.replace(
-            "@routes.get('/')",
-            "@routes.get(PromptServer.NB_PREFIX + '/')"
-        )
+        for old, new in replacements:
+            content = content.replace(old, new)
         
-        # Find and replace all route definitions
-        patched_content = re.sub(
-            r'@routes\.(get|post|put|delete)\([\'"]\/([^\'"]*)[\'"]',
-            r'@routes.\1(PromptServer.NB_PREFIX + \'/\2\'',
-            patched_content
-        )
-        
-        # Fix static routes for web root
-        patched_content = patched_content.replace(
+        # Fix static routes
+        content = content.replace(
             "web.static('/', self.web_root)",
-            "web.static(PromptServer.NB_PREFIX + '/', self.web_root)"
+            f"web.static(NB_PREFIX + '/', self.web_root)"
         )
         
-        # Fix static routes for extensions
-        patched_content = patched_content.replace(
+        content = content.replace(
             "web.static('/extensions/' + name, dir)",
-            "web.static(PromptServer.NB_PREFIX + '/extensions/' + name, dir)"
+            f"web.static(NB_PREFIX + '/extensions/' + name, dir)"
         )
         
-        # Fix websocket connections
-        patched_content = patched_content.replace(
+        # Add prefix to websocket response
+        content = content.replace(
             "await self.send(\"status\", { \"status\": self.get_queue_info(), 'sid': sid }, sid)",
-            "await self.send(\"status\", { \"status\": self.get_queue_info(), 'sid': sid, 'prefix': PromptServer.NB_PREFIX }, sid)"
+            "await self.send(\"status\", { \"status\": self.get_queue_info(), 'sid': sid, 'prefix': NB_PREFIX }, sid)"
         )
-        
-        # Fix URL references in index.html
-        for html_file in ["index.html", "index.html.bak"]:
-            html_path = os.path.join(COMFY_DIR, "web", html_file)
-            if os.path.exists(html_path):
-                with open(html_path, 'r') as file:
-                    html_content = file.read()
-                
-                # Fix absolute paths in HTML
-                html_content = html_content.replace(
-                    'href="/',
-                    f'href="{NB_PREFIX}/'
-                )
-                html_content = html_content.replace(
-                    'src="/',
-                    f'src="{NB_PREFIX}/'
-                )
-                
-                with open(html_path, 'w') as file:
-                    file.write(html_content)
-                logger.info(f"Patched {html_file} for Kubeflow integration")
         
         # Write patched content back
         with open(server_path, 'w') as file:
-            file.write(patched_content)
+            file.write(content)
         
-        logger.info("Successfully patched server.py for Kubeflow integration")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to patch ComfyUI server.py: {str(e)}")
-        return False
-
-def patch_comfyui_js():
-    """
-    Patch ComfyUI's JavaScript files to work with Kubeflow URL prefix
-    """
-    try:
-        # Patch main.js to handle prefix in API calls
+        # Patch index.html to include prefix
+        index_path = os.path.join(COMFY_DIR, "web", "index.html")
+        if os.path.exists(index_path):
+            with open(index_path, 'r') as file:
+                html_content = file.read()
+            
+            # Add base URL prefix to script and link tags
+            html_content = html_content.replace('src="scripts/', f'src="{NB_PREFIX}/scripts/')
+            html_content = html_content.replace('href="style.css', f'href="{NB_PREFIX}/style.css')
+            
+            # Add script to set global prefix
+            html_content = html_content.replace('</head>', f'<script>window.comfyPrefix = "{NB_PREFIX}";</script></head>')
+            
+            with open(index_path, 'w') as file:
+                file.write(html_content)
+            logger.info("Patched index.html for Kubeflow integration")
+        
+        # Patch main.js for WebSocket connection
         main_js_path = os.path.join(COMFY_DIR, "web", "scripts", "main.js")
         if os.path.exists(main_js_path):
             with open(main_js_path, 'r') as file:
                 js_content = file.read()
             
-            # Add prefix handling to fetch calls
-            if "const prefix = '" not in js_content:
-                # Inject prefix code at the beginning after the first imports
-                prefix_code = """
-// Kubeflow integration
-const prefix = document.currentScript?.getAttribute('data-prefix') || 
-               window.comfyPrefix || 
-               '';
-
-// Update API paths with prefix
-const api = {};
-api.apiURL = (path) => prefix + path;
-                """
-                
-                # Replace direct API calls with prefixed ones
+            # Fix WebSocket URL
+            if "const socket = new WebSocket(" in js_content:
                 js_content = js_content.replace(
-                    'fetch("/',
-                    'fetch(prefix + "/'
+                    "const socket = new WebSocket(",
+                    "const prefix = window.comfyPrefix || '';\n\tconst socket = new WebSocket("
                 )
                 js_content = js_content.replace(
-                    'fetch(\'/',
-                    'fetch(prefix + \'/'
+                    "const socket = new WebSocket(`ws${location.protocol === 'https:' ? 's' : ''}://${location.host}/ws",
+                    "const socket = new WebSocket(`ws${location.protocol === 'https:' ? 's' : ''}://${location.host}${prefix}/ws"
                 )
-                
-                # Also fix WebSocket connection
-                js_content = js_content.replace(
-                    'const socket = new WebSocket(`ws',
-                    'const socket = new WebSocket(`ws${window.location.protocol === "https:" ? "s" : ""}://${window.location.host}${prefix}/ws'
-                )
-                
-                with open(main_js_path, 'w') as file:
-                    file.write(js_content)
-                
-                logger.info("Patched main.js for Kubeflow integration")
+            
+            with open(main_js_path, 'w') as file:
+                file.write(js_content)
+            logger.info("Patched main.js for WebSocket connections")
+        
+        logger.info("Successfully patched server.py for Kubeflow integration")
         return True
     except Exception as e:
-        logger.error(f"Failed to patch ComfyUI JS files: {str(e)}")
+        logger.error(f"Failed to patch ComfyUI server.py: {str(e)}")
         return False
 
 def modify_port():
@@ -198,10 +177,11 @@ def start_comfyui():
         
         logger.info(f"Starting ComfyUI with command: {' '.join(cmd)}")
         
-        # Use subprocess to keep running in foreground
-        process = subprocess.run(cmd)
+        # Execute ComfyUI directly (this will replace the current process)
+        os.execv(sys.executable, [sys.executable] + ["main.py", "--listen", "0.0.0.0"])
         
-        return process.returncode == 0
+        # This line will never be reached because execv replaces the current process
+        return True
     except Exception as e:
         logger.error(f"Failed to start ComfyUI: {str(e)}")
         return False
@@ -219,15 +199,12 @@ if __name__ == "__main__":
         logger.error("Failed to patch ComfyUI server")
         sys.exit(1)
     
-    if not patch_comfyui_js():
-        logger.warning("Failed to patch ComfyUI JavaScript files")
-        # Continue anyway, might still work
-    
     if not modify_port():
         logger.warning("Failed to modify port in main.py")
         # Continue anyway, might still work with arguments
     
     # Start ComfyUI
-    if not start_comfyui():
-        logger.error("Failed to start ComfyUI")
-        sys.exit(1)
+    start_comfyui()
+    # If we get here, something went wrong
+    logger.error("Failed to start ComfyUI")
+    sys.exit(1)
