@@ -3,14 +3,15 @@
 ComfyUI Kubeflow Adapter
 
 This script serves as an adapter between Kubeflow's URL structure and ComfyUI.
-It modifies ComfyUI's server.py to work with Kubeflow's URL prefix system.
+It modifies ComfyUI's server.py to work with Kubeflow's URL prefix system
+and addresses security restrictions.
 """
 
 import os
 import sys
 import shutil
 import logging
-import re
+import subprocess
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, 
@@ -27,7 +28,6 @@ KUBEFLOW_PORT = 8888  # Kubeflow uses 8888
 def patch_comfyui_server():
     """
     Patch ComfyUI's server.py to work with Kubeflow URL prefix and security settings
-    Carefully handles indentation to avoid Python syntax errors.
     """
     try:
         server_path = os.path.join(COMFY_DIR, "server.py")
@@ -41,101 +41,86 @@ def patch_comfyui_server():
             logger.info("Restoring original server.py for clean patching")
             shutil.copy2(backup_path, server_path)
         
-        # Read original content
         with open(server_path, 'r') as file:
             content = file.read()
         
         # Add NB_PREFIX as a global variable at the top of the file
         if "NB_PREFIX = os.environ.get('NB_PREFIX', '')" not in content:
-            content = content.replace(
-                "import os\nimport sys\nimport asyncio\nimport traceback",
-                "import os\nimport sys\nimport asyncio\nimport traceback\n\n# Kubeflow integration\nNB_PREFIX = os.environ.get('NB_PREFIX', '')"
-            )
+            content = "import os\nimport sys\nimport asyncio\nimport traceback\n\n# Kubeflow integration\nNB_PREFIX = os.environ.get('NB_PREFIX', '')\n" + content[content.find("import os\n") + len("import os\n"):]
         
-        # We'll use more precise pattern matching with line-based replacements to avoid indentation issues
-        lines = content.split('\n')
-        new_lines = []
-        
-        # Process the file line by line
-        i = 0
-        while i < len(lines):
-            line = lines[i]
+        # More careful CORS settings modification - maintaining indentation
+        if "create_cors_middleware" in content:
+            # For origin_only_middleware, we need to be careful about indentation
+            # Find the origin_only_middleware creation and just comment it out without changing indentation
+            lines = content.split('\n')
+            for i, line in enumerate(lines):
+                if "middlewares.append(create_origin_only_middleware())" in line:
+                    indent = line[:len(line) - len(line.lstrip())]
+                    lines[i] = f"{indent}# Disabled for Kubeflow compatibility\n{indent}# {line.lstrip()}"
+                elif "if args.enable_cors_header:" in line:
+                    indent = line[:len(line) - len(line.lstrip())]
+                    lines[i] = f"{indent}# Always enable CORS for Kubeflow\n{indent}if True:"
+                elif "if host_domain != origin_domain:" in line:
+                    indent = line[:len(line) - len(line.lstrip())]
+                    lines[i] = f"{indent}if False:  # Disabled for Kubeflow compatibility"
             
-            # Disable the origin_only_middleware
-            if "middlewares.append(create_origin_only_middleware())" in line:
-                indent = line[:len(line) - len(line.lstrip())]
-                new_lines.append(f"{indent}# Disabled for Kubeflow compatibility")
-                new_lines.append(f"{indent}# middlewares.append(create_origin_only_middleware())")
-                i += 1
-                continue
-                
-            # Fix the CORS middleware
-            elif "if args.enable_cors_header:" in line:
-                indent = line[:len(line) - len(line.lstrip())]
-                new_lines.append(f"{indent}# Always enable CORS for Kubeflow")
-                new_lines.append(f"{indent}if True:")
-                i += 1
-                continue
-                
-            # Replace routes with prefixed versions
-            elif re.match(r"@routes\.(get|post)\(['\"]/(.*?)['\"]\)", line):
-                route_type = re.search(r"@routes\.(get|post)", line).group(1)
-                route_path = re.search(r"['\"]/(.*?)['\"]", line).group(0)
-                indent = line[:len(line) - len(line.lstrip())]
-                
-                # Special handling for routes with parameters
-                if "{" in route_path:
-                    route_path_escaped = route_path.replace("{", "{{").replace("}", "}}")
-                    new_line = f"{indent}@routes.{route_type}(NB_PREFIX + {route_path_escaped})"
-                else:
-                    new_line = f"{indent}@routes.{route_type}(NB_PREFIX + {route_path})"
-                    
-                new_lines.append(new_line)
-                i += 1
-                continue
-                
-            # Fix static routes
-            elif "web.static('/', self.web_root)" in line:
-                indent = line[:len(line) - len(line.lstrip())]
-                new_lines.append(f"{indent}web.static(NB_PREFIX + '/', self.web_root)")
-                i += 1
-                continue
-                
-            elif "web.static('/extensions/' + name, dir)" in line:
-                indent = line[:len(line) - len(line.lstrip())]
-                new_lines.append(f"{indent}web.static(NB_PREFIX + '/extensions/' + name, dir)")
-                i += 1
-                continue
-                
-            # Disable host validation check
-            elif "if host_domain != origin_domain:" in line:
-                indent = line[:len(line) - len(line.lstrip())]
-                new_lines.append(f"{indent}if False:  # Disabled for Kubeflow compatibility")
-                i += 1
-                continue
-                
-            # Add prefix to websocket response
-            elif "await self.send(\"status\", { \"status\": self.get_queue_info(), 'sid': sid }, sid)" in line:
-                indent = line[:len(line) - len(line.lstrip())]
-                new_lines.append(f"{indent}await self.send(\"status\", {{ \"status\": self.get_queue_info(), 'sid': sid, 'prefix': NB_PREFIX }}, sid)")
-                i += 1
-                continue
-                
-            # Fix the log message
-            elif "logging.info(\"To see the GUI go to: {}://{}:{}\".format(scheme, address_print, port))" in line:
-                indent = line[:len(line) - len(line.lstrip())]
-                new_lines.append(f"{indent}logging.info(\"To see the GUI go to Kubeflow UI and open the notebook server with prefix: \" + NB_PREFIX)")
-                i += 1
-                continue
-                
-            # Keep the line as is
-            else:
-                new_lines.append(line)
-                i += 1
+            content = '\n'.join(lines)
         
-        # Write the patched content back to the file
+        # Patch routes one by one to maintain correct patterns
+        routes_to_patch = [
+            ("@routes.get('/ws')", f"@routes.get(NB_PREFIX + '/ws')"),
+            ("@routes.get('/')", f"@routes.get(NB_PREFIX + '/')"),
+            ("@routes.get('/embeddings')", f"@routes.get(NB_PREFIX + '/embeddings')"),
+            ("@routes.get('/models')", f"@routes.get(NB_PREFIX + '/models')"),
+            ("@routes.get('/models/{folder}')", f"@routes.get(NB_PREFIX + '/models/{{folder}}')"),
+            ("@routes.get('/extensions')", f"@routes.get(NB_PREFIX + '/extensions')"),
+            ("@routes.post('/upload/image')", f"@routes.post(NB_PREFIX + '/upload/image')"),
+            ("@routes.post('/upload/mask')", f"@routes.post(NB_PREFIX + '/upload/mask')"),
+            ("@routes.get('/view')", f"@routes.get(NB_PREFIX + '/view')"),
+            ("@routes.get('/view_metadata/{folder_name}')", f"@routes.get(NB_PREFIX + '/view_metadata/{{folder_name}}')"),
+            ("@routes.get('/system_stats')", f"@routes.get(NB_PREFIX + '/system_stats')"),
+            ("@routes.get('/prompt')", f"@routes.get(NB_PREFIX + '/prompt')"),
+            ("@routes.get('/object_info')", f"@routes.get(NB_PREFIX + '/object_info')"),
+            ("@routes.get('/object_info/{node_class}')", f"@routes.get(NB_PREFIX + '/object_info/{{node_class}}')"),
+            ("@routes.get('/history')", f"@routes.get(NB_PREFIX + '/history')"),
+            ("@routes.get('/history/{prompt_id}')", f"@routes.get(NB_PREFIX + '/history/{{prompt_id}}')"),
+            ("@routes.get('/queue')", f"@routes.get(NB_PREFIX + '/queue')"),
+            ("@routes.post('/prompt')", f"@routes.post(NB_PREFIX + '/prompt')"),
+            ("@routes.post('/queue')", f"@routes.post(NB_PREFIX + '/queue')"),
+            ("@routes.post('/interrupt')", f"@routes.post(NB_PREFIX + '/interrupt')"),
+            ("@routes.post('/free')", f"@routes.post(NB_PREFIX + '/free')"),
+            ("@routes.post('/history')", f"@routes.post(NB_PREFIX + '/history')")
+        ]
+        
+        for old, new in routes_to_patch:
+            content = content.replace(old, new)
+        
+        # Fix static routes
+        content = content.replace(
+            "web.static('/', self.web_root)",
+            f"web.static(NB_PREFIX + '/', self.web_root)"
+        )
+        
+        content = content.replace(
+            "web.static('/extensions/' + name, dir)",
+            f"web.static(NB_PREFIX + '/extensions/' + name, dir)"
+        )
+        
+        # Add prefix to websocket response
+        content = content.replace(
+            "await self.send(\"status\", { \"status\": self.get_queue_info(), 'sid': sid }, sid)",
+            "await self.send(\"status\", { \"status\": self.get_queue_info(), 'sid': sid, 'prefix': NB_PREFIX }, sid)"
+        )
+        
+        # Fix the address print line for the log message
+        content = content.replace(
+            'logging.info("To see the GUI go to: {}://{}:{}".format(scheme, address_print, port))',
+            f'logging.info("To see the GUI go to Kubeflow UI and open the notebook server with prefix: " + NB_PREFIX)'
+        )
+        
+        # Write patched content back
         with open(server_path, 'w') as file:
-            file.write('\n'.join(new_lines))
+            file.write(content)
         
         # Patch index.html to include prefix
         index_path = os.path.join(COMFY_DIR, "web", "index.html")
@@ -201,7 +186,7 @@ def start_comfyui():
         logger.info(f"Starting ComfyUI with command: {' '.join(cmd)}")
         
         # Execute ComfyUI directly (this will replace the current process)
-        os.execv(sys.executable, [sys.executable] + cmd[1:])
+        os.execv(sys.executable, cmd)
         
         # This line will never be reached because execv replaces the current process
         return True
