@@ -25,13 +25,10 @@ RUN chown -R ${NB_USER}:${NB_GID} /tmp_home/jovyan/ComfyUI/models
 RUN pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu124
 WORKDIR /tmp_home/jovyan/ComfyUI
 RUN pip install -r requirements.txt
-RUN pip install flask
 
-# Copy our Flask proxy app that will serve ComfyUI
-COPY app.py /tmp_home/jovyan/
-COPY templates /tmp_home/jovyan/templates/
-RUN chown -R ${NB_USER}:${NB_GID} /tmp_home/jovyan/app.py
-RUN chown -R ${NB_USER}:${NB_GID} /tmp_home/jovyan/templates
+# Create a custom comfyui startup script that will handle the Kubeflow path prefix
+COPY comfyui-start.py /tmp_home/jovyan/ComfyUI/
+RUN chown ${NB_USER}:${NB_GID} /tmp_home/jovyan/ComfyUI/comfyui-start.py
 
 # Remove the code-server service to prevent it from starting
 RUN rm -f /etc/services.d/code-server/run || true
