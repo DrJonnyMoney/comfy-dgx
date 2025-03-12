@@ -9,6 +9,9 @@ RUN apt-get update && apt-get install -y \
     git \
     libgl1-mesa-glx \
     libglib2.0-0 \
+    libgomp1 \
+    curl \
+    wget \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -18,17 +21,36 @@ RUN git clone https://github.com/comfyanonymous/ComfyUI.git /tmp_home/jovyan/Com
 RUN chown -R ${NB_USER}:${NB_GID} /tmp_home/jovyan/ComfyUI
 
 # Create models directory structure
-RUN mkdir -p /tmp_home/jovyan/ComfyUI/models/checkpoints
+RUN mkdir -p /tmp_home/jovyan/ComfyUI/models/checkpoints \
+    /tmp_home/jovyan/ComfyUI/models/clip \
+    /tmp_home/jovyan/ComfyUI/models/clip_vision \
+    /tmp_home/jovyan/ComfyUI/models/controlnet \
+    /tmp_home/jovyan/ComfyUI/models/diffusers \
+    /tmp_home/jovyan/ComfyUI/models/embeddings \
+    /tmp_home/jovyan/ComfyUI/models/gligen \
+    /tmp_home/jovyan/ComfyUI/models/hypernetworks \
+    /tmp_home/jovyan/ComfyUI/models/ipadapter \
+    /tmp_home/jovyan/ComfyUI/models/loras \
+    /tmp_home/jovyan/ComfyUI/models/style_models \
+    /tmp_home/jovyan/ComfyUI/models/unet \
+    /tmp_home/jovyan/ComfyUI/models/upscale_models \
+    /tmp_home/jovyan/ComfyUI/models/vae \
+    /tmp_home/jovyan/ComfyUI/input \
+    /tmp_home/jovyan/ComfyUI/output
+    
 RUN chown -R ${NB_USER}:${NB_GID} /tmp_home/jovyan/ComfyUI/models
+RUN chown -R ${NB_USER}:${NB_GID} /tmp_home/jovyan/ComfyUI/input
+RUN chown -R ${NB_USER}:${NB_GID} /tmp_home/jovyan/ComfyUI/output
 
 # Install PyTorch with CUDA support and ComfyUI requirements
 RUN pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu124
 WORKDIR /tmp_home/jovyan/ComfyUI
 RUN pip install -r requirements.txt
 
-# Create a custom comfyui startup script that will handle the Kubeflow path prefix
-COPY comfyui-start.py /tmp_home/jovyan/ComfyUI/
-RUN chown ${NB_USER}:${NB_GID} /tmp_home/jovyan/ComfyUI/comfyui-start.py
+# Copy the Kubeflow adapter script
+COPY comfyui-kubeflow-adapter.py /tmp_home/jovyan/ComfyUI/
+RUN chmod +x /tmp_home/jovyan/ComfyUI/comfyui-kubeflow-adapter.py
+RUN chown ${NB_USER}:${NB_GID} /tmp_home/jovyan/ComfyUI/comfyui-kubeflow-adapter.py
 
 # Remove the code-server service to prevent it from starting
 RUN rm -f /etc/services.d/code-server/run || true
