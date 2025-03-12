@@ -195,180 +195,7 @@ class PromptServer():
 
         self.on_prompt_handlers = []
 
-        @routes.post(NB_PREFIX + '/history')
-        async def post_history(request):
-            json_data =  await request.json()
-            if "clear" in json_data:
-                if json_data["clear"]:
-                    self.prompt_queue.wipe_history()
-            if "delete" in json_data:
-                to_delete = json_data['delete']
-                for id_to_delete in to_delete:
-                    self.prompt_queue.delete_history_item(id_to_delete)
-
-            return web.Response(status=200)
-
-    async def setup(self):
-        timeout = aiohttp.ClientTimeout(total=None) # no timeout
-        self.client_session = aiohttp.ClientSession(timeout=timeout)
-
-    def add_routes(self):
-        self.user_manager.add_routes(self.routes)
-        self.model_file_manager.add_routes(self.routes)
-        self.custom_node_manager.add_routes(self.routes, self.app, nodes.LOADED_MODULE_DIRS.items())
-        self.app.add_subapp('/internal', self.internal_routes.get_app())
-
-        # Prefix every route with /api for easier matching for delegation.
-        # This is very useful for frontend dev server, which need to forward
-        # everything except serving of static files.
-        # Currently both the old endpoints without prefix and new endpoints with
-        # prefix are supported.
-        api_routes = web.RouteTableDef()
-        for route in self.routes:
-            # Custom nodes might add extra static routes. Only process non-static
-            # routes to add /api prefix.
-            if isinstance(route, web.RouteDef):
-                api_routes.route(route.method, "/api" + route.path)(route.handler, **route.kwargs)
-        self.app.add_routes(api_routes)
-        self.app.add_routes(self.routes)
-
-        # Add routes from web extensions.
-        for name, dir in nodes.EXTENSION_WEB_DIRS.items():
-            self.app.add_routes([web.static(NB_PREFIX + '/extensions/' + name, dir)])
-
-        self.app.add_routes([
-            web.static(NB_PREFIX + '/', self.web_root),
-        ])
-
-    def get_queue_info(self):
-        prompt_info = {}
-        exec_info = {}
-        exec_info['queue_remaining'] = self.prompt_queue.get_tasks_remaining()
-        prompt_info['exec_info'] = exec_info
-        return prompt_info
-
-    async def send(self, event, data, sid=None):
-        if event == BinaryEventTypes.UNENCODED_PREVIEW_IMAGE:
-            await self.send_image(data, sid=sid)
-        elif isinstance(data, (bytes, bytearray)):
-            await self.send_bytes(event, data, sid)
-        else:
-            await self.send_json(event, data, sid)
-
-    def encode_bytes(self, event, data):
-        if not isinstance(event, int):
-            raise RuntimeError(f"Binary event types must be integers, got {event}")
-
-        packed = struct.pack(">I", event)
-        message = bytearray(packed)
-        message.extend(data)
-        return message
-
-    async def send_image(self, image_data, sid=None):
-        image_type = image_data[0]
-        image = image_data[1]
-        max_size = image_data[2]
-        if max_size is not None:
-            if hasattr(Image, 'Resampling'):
-                resampling = Image.Resampling.BILINEAR
-            else:
-                resampling = Image.ANTIALIAS
-
-            image = ImageOps.contain(image, (max_size, max_size), resampling)
-        type_num = 1
-        if image_type == "JPEG":
-            type_num = 1
-        elif image_type == "PNG":
-            type_num = 2
-
-        bytesIO = BytesIO()
-        header = struct.pack(">I", type_num)
-        bytesIO.write(header)
-        image.save(bytesIO, format=image_type, quality=95, compress_level=1)
-        preview_bytes = bytesIO.getvalue()
-        await self.send_bytes(BinaryEventTypes.PREVIEW_IMAGE, preview_bytes, sid=sid)
-
-    async def send_bytes(self, event, data, sid=None):
-        message = self.encode_bytes(event, data)
-
-        if sid is None:
-            sockets = list(self.sockets.values())
-            for ws in sockets:
-                await send_socket_catch_exception(ws.send_bytes, message)
-        elif sid in self.sockets:
-            await send_socket_catch_exception(self.sockets[sid].send_bytes, message)
-
-    async def send_json(self, event, data, sid=None):
-        message = {"type": event, "data": data}
-
-        if sid is None:
-            sockets = list(self.sockets.values())
-            for ws in sockets:
-                await send_socket_catch_exception(ws.send_json, message)
-        elif sid in self.sockets:
-            await send_socket_catch_exception(self.sockets[sid].send_json, message)
-
-    def send_sync(self, event, data, sid=None):
-        self.loop.call_soon_threadsafe(
-            self.messages.put_nowait, (event, data, sid))
-
-    def queue_updated(self):
-        self.send_sync("status", { "status": self.get_queue_info() })
-
-    async def publish_loop(self):
-        while True:
-            msg = await self.messages.get()
-            await self.send(*msg)
-
-    async def start(self, address, port, verbose=True, call_on_start=None):
-        await self.start_multi_address([(address, port)], call_on_start=call_on_start)
-
-    async def start_multi_address(self, addresses, call_on_start=None, verbose=True):
-        runner = web.AppRunner(self.app, access_log=None)
-        await runner.setup()
-        ssl_ctx = None
-        scheme = "http"
-        if args.tls_keyfile and args.tls_certfile:
-                ssl_ctx = ssl.SSLContext(protocol=ssl.PROTOCOL_TLS_SERVER, verify_mode=ssl.CERT_NONE)
-                ssl_ctx.load_cert_chain(certfile=args.tls_certfile,
-                                keyfile=args.tls_keyfile)
-                scheme = "https"
-
-        if verbose:
-            logging.info("Starting server\n")
-        for addr in addresses:
-            address = addr[0]
-            port = addr[1]
-            site = web.TCPSite(runner, address, port, ssl_context=ssl_ctx)
-            await site.start()
-
-            if not hasattr(self, 'address'):
-                self.address = address #TODO: remove this
-                self.port = port
-
-            if ':' in address:
-                address_print = "[{}]".format(address)
-            else:
-                address_print = address
-
-            if verbose:
-                logging.info("To see the GUI go to Kubeflow UI and open the notebook server with prefix: " + NB_PREFIX)
-
-        if call_on_start is not None:
-            call_on_start(scheme, self.address, self.port)
-
-    def add_on_prompt_handler(self, handler):
-        self.on_prompt_handlers.append(handler)
-
-    def trigger_on_prompt(self, json_data):
-        for handler in self.on_prompt_handlers:
-            try:
-                json_data = handler(json_data)
-            except Exception:
-                logging.warning("[ERROR] An error occurred during the on_prompt_handler processing")
-                logging.warning(traceback.format_exc())
-
-        return json_data.get(NB_PREFIX + '/ws')
+        @routes.get(NB_PREFIX + '/ws')
         async def websocket_handler(request):
             ws = web.WebSocketResponse()
             await ws.prepare(request)
@@ -868,4 +695,177 @@ class PromptServer():
                 self.prompt_queue.set_flag("free_memory", free_memory)
             return web.Response(status=200)
 
-        @routes
+        @routes.post(NB_PREFIX + '/history')
+        async def post_history(request):
+            json_data =  await request.json()
+            if "clear" in json_data:
+                if json_data["clear"]:
+                    self.prompt_queue.wipe_history()
+            if "delete" in json_data:
+                to_delete = json_data['delete']
+                for id_to_delete in to_delete:
+                    self.prompt_queue.delete_history_item(id_to_delete)
+
+            return web.Response(status=200)
+
+    async def setup(self):
+        timeout = aiohttp.ClientTimeout(total=None) # no timeout
+        self.client_session = aiohttp.ClientSession(timeout=timeout)
+
+    def add_routes(self):
+        self.user_manager.add_routes(self.routes)
+        self.model_file_manager.add_routes(self.routes)
+        self.custom_node_manager.add_routes(self.routes, self.app, nodes.LOADED_MODULE_DIRS.items())
+        self.app.add_subapp('/internal', self.internal_routes.get_app())
+
+        # Prefix every route with /api for easier matching for delegation.
+        # This is very useful for frontend dev server, which need to forward
+        # everything except serving of static files.
+        # Currently both the old endpoints without prefix and new endpoints with
+        # prefix are supported.
+        api_routes = web.RouteTableDef()
+        for route in self.routes:
+            # Custom nodes might add extra static routes. Only process non-static
+            # routes to add /api prefix.
+            if isinstance(route, web.RouteDef):
+                api_routes.route(route.method, "/api" + route.path)(route.handler, **route.kwargs)
+        self.app.add_routes(api_routes)
+        self.app.add_routes(self.routes)
+
+        # Add routes from web extensions.
+        for name, dir in nodes.EXTENSION_WEB_DIRS.items():
+            self.app.add_routes([web.static(NB_PREFIX + '/extensions/' + name, dir)])
+
+        self.app.add_routes([
+            web.static(NB_PREFIX + '/', self.web_root),
+        ])
+
+    def get_queue_info(self):
+        prompt_info = {}
+        exec_info = {}
+        exec_info['queue_remaining'] = self.prompt_queue.get_tasks_remaining()
+        prompt_info['exec_info'] = exec_info
+        return prompt_info
+
+    async def send(self, event, data, sid=None):
+        if event == BinaryEventTypes.UNENCODED_PREVIEW_IMAGE:
+            await self.send_image(data, sid=sid)
+        elif isinstance(data, (bytes, bytearray)):
+            await self.send_bytes(event, data, sid)
+        else:
+            await self.send_json(event, data, sid)
+
+    def encode_bytes(self, event, data):
+        if not isinstance(event, int):
+            raise RuntimeError(f"Binary event types must be integers, got {event}")
+
+        packed = struct.pack(">I", event)
+        message = bytearray(packed)
+        message.extend(data)
+        return message
+
+    async def send_image(self, image_data, sid=None):
+        image_type = image_data[0]
+        image = image_data[1]
+        max_size = image_data[2]
+        if max_size is not None:
+            if hasattr(Image, 'Resampling'):
+                resampling = Image.Resampling.BILINEAR
+            else:
+                resampling = Image.ANTIALIAS
+
+            image = ImageOps.contain(image, (max_size, max_size), resampling)
+        type_num = 1
+        if image_type == "JPEG":
+            type_num = 1
+        elif image_type == "PNG":
+            type_num = 2
+
+        bytesIO = BytesIO()
+        header = struct.pack(">I", type_num)
+        bytesIO.write(header)
+        image.save(bytesIO, format=image_type, quality=95, compress_level=1)
+        preview_bytes = bytesIO.getvalue()
+        await self.send_bytes(BinaryEventTypes.PREVIEW_IMAGE, preview_bytes, sid=sid)
+
+    async def send_bytes(self, event, data, sid=None):
+        message = self.encode_bytes(event, data)
+
+        if sid is None:
+            sockets = list(self.sockets.values())
+            for ws in sockets:
+                await send_socket_catch_exception(ws.send_bytes, message)
+        elif sid in self.sockets:
+            await send_socket_catch_exception(self.sockets[sid].send_bytes, message)
+
+    async def send_json(self, event, data, sid=None):
+        message = {"type": event, "data": data}
+
+        if sid is None:
+            sockets = list(self.sockets.values())
+            for ws in sockets:
+                await send_socket_catch_exception(ws.send_json, message)
+        elif sid in self.sockets:
+            await send_socket_catch_exception(self.sockets[sid].send_json, message)
+
+    def send_sync(self, event, data, sid=None):
+        self.loop.call_soon_threadsafe(
+            self.messages.put_nowait, (event, data, sid))
+
+    def queue_updated(self):
+        self.send_sync("status", { "status": self.get_queue_info() })
+
+    async def publish_loop(self):
+        while True:
+            msg = await self.messages.get()
+            await self.send(*msg)
+
+    async def start(self, address, port, verbose=True, call_on_start=None):
+        await self.start_multi_address([(address, port)], call_on_start=call_on_start)
+
+    async def start_multi_address(self, addresses, call_on_start=None, verbose=True):
+        runner = web.AppRunner(self.app, access_log=None)
+        await runner.setup()
+        ssl_ctx = None
+        scheme = "http"
+        if args.tls_keyfile and args.tls_certfile:
+                ssl_ctx = ssl.SSLContext(protocol=ssl.PROTOCOL_TLS_SERVER, verify_mode=ssl.CERT_NONE)
+                ssl_ctx.load_cert_chain(certfile=args.tls_certfile,
+                                keyfile=args.tls_keyfile)
+                scheme = "https"
+
+        if verbose:
+            logging.info("Starting server\n")
+        for addr in addresses:
+            address = addr[0]
+            port = addr[1]
+            site = web.TCPSite(runner, address, port, ssl_context=ssl_ctx)
+            await site.start()
+
+            if not hasattr(self, 'address'):
+                self.address = address #TODO: remove this
+                self.port = port
+
+            if ':' in address:
+                address_print = "[{}]".format(address)
+            else:
+                address_print = address
+
+            if verbose:
+                logging.info("To see the GUI go to Kubeflow UI and open the notebook server with prefix: " + NB_PREFIX)
+
+        if call_on_start is not None:
+            call_on_start(scheme, self.address, self.port)
+
+    def add_on_prompt_handler(self, handler):
+        self.on_prompt_handlers.append(handler)
+
+    def trigger_on_prompt(self, json_data):
+        for handler in self.on_prompt_handlers:
+            try:
+                json_data = handler(json_data)
+            except Exception:
+                logging.warning("[ERROR] An error occurred during the on_prompt_handler processing")
+                logging.warning(traceback.format_exc())
+
+        return json_data
