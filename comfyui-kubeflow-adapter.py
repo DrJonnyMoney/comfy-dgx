@@ -3,7 +3,8 @@
 ComfyUI Kubeflow Adapter
 
 This script serves as an adapter between Kubeflow's URL structure and ComfyUI.
-It modifies ComfyUI's server.py to work with Kubeflow's URL prefix system.
+It modifies ComfyUI's server.py to work with Kubeflow's URL prefix system
+and addresses security restrictions.
 """
 
 import os
@@ -26,7 +27,7 @@ KUBEFLOW_PORT = 8888  # Kubeflow uses 8888
 
 def patch_comfyui_server():
     """
-    Patch ComfyUI's server.py to work with Kubeflow URL prefix
+    Patch ComfyUI's server.py to work with Kubeflow URL prefix and security settings
     """
     try:
         server_path = os.path.join(COMFY_DIR, "server.py")
@@ -46,8 +47,28 @@ def patch_comfyui_server():
         # Add NB_PREFIX as a global variable at the top of the file
         if "NB_PREFIX = os.environ.get('NB_PREFIX', '')" not in content:
             content = "import os\nimport sys\nimport asyncio\nimport traceback\n\n# Kubeflow integration\nNB_PREFIX = os.environ.get('NB_PREFIX', '')\n" + content[content.find("import os\n") + len("import os\n"):]
+        
+        # Modify CORS settings to be more permissive - Important for Kubeflow
+        if "create_cors_middleware" in content:
+            # Enable CORS for all origins in ComfyUI
+            content = content.replace(
+                "def create_cors_middleware(allowed_origin: str):",
+                "def create_cors_middleware(allowed_origin: str = '*'):"
+            )
             
-        # Patch routes one by one manually instead of using regex
+            # Ensure CORS middleware is always added
+            content = content.replace(
+                "if args.enable_cors_header:",
+                "# Always enable CORS for Kubeflow\nif True:"
+            )
+            
+            # Disable the origin_only_middleware which can block Kubeflow requests
+            content = content.replace(
+                "middlewares.append(create_origin_only_middleware())",
+                "# Disabled for Kubeflow compatibility\n            # middlewares.append(create_origin_only_middleware())"
+            )
+        
+        # Patch routes one by one manually
         replacements = [
             ("@routes.get('/ws')", f"@routes.get(NB_PREFIX + '/ws')"),
             ("@routes.get('/')", f"@routes.get(NB_PREFIX + '/')"),
@@ -98,6 +119,13 @@ def patch_comfyui_server():
             'logging.info("To see the GUI go to: {}://{}:{}".format(scheme, address_print, port))',
             f'logging.info("To see the GUI go to Kubeflow UI and open the notebook server with prefix: " + NB_PREFIX)'
         )
+        
+        # Disable Host validation - critical for Kubeflow proxy
+        if "host_domain != origin_domain" in content:
+            content = content.replace(
+                "if host_domain != origin_domain:",
+                "if False and host_domain != origin_domain:  # Disabled for Kubeflow compatibility"
+            )
         
         # Write patched content back
         with open(server_path, 'w') as file:
@@ -155,13 +183,19 @@ def start_comfyui():
         # Change to ComfyUI directory
         os.chdir(COMFY_DIR)
         
-        # Start ComfyUI with explicit port parameter
-        cmd = [sys.executable, "main.py", "--listen", "0.0.0.0", "--port", str(KUBEFLOW_PORT)]
+        # Start ComfyUI with explicit port parameter and disable security checks
+        cmd = [
+            sys.executable, 
+            "main.py", 
+            "--listen", "0.0.0.0", 
+            "--port", str(KUBEFLOW_PORT),
+            "--enable-cors-header", "*"  # Enable CORS for all origins
+        ]
         
         logger.info(f"Starting ComfyUI with command: {' '.join(cmd)}")
         
         # Execute ComfyUI directly (this will replace the current process)
-        os.execv(sys.executable, [sys.executable] + ["main.py", "--listen", "0.0.0.0", "--port", str(KUBEFLOW_PORT)])
+        os.execv(sys.executable, [sys.executable] + ["main.py", "--listen", "0.0.0.0", "--port", str(KUBEFLOW_PORT), "--enable-cors-header", "*"])
         
         # This line will never be reached because execv replaces the current process
         return True
@@ -182,7 +216,7 @@ if __name__ == "__main__":
         logger.error("Failed to patch ComfyUI server")
         sys.exit(1)
     
-    # Start ComfyUI with explicit port
+    # Start ComfyUI with explicit port and security settings
     start_comfyui()
     # If we get here, something went wrong
     logger.error("Failed to start ComfyUI")
