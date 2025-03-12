@@ -47,10 +47,9 @@ RUN pip install --pre torch torchvision torchaudio --index-url https://download.
 WORKDIR /tmp_home/jovyan/ComfyUI
 RUN pip install -r requirements.txt
 
-# Copy the Kubeflow adapter script
-COPY comfyui-kubeflow-adapter.py /tmp_home/jovyan/ComfyUI/
-RUN chmod +x /tmp_home/jovyan/ComfyUI/comfyui-kubeflow-adapter.py
-RUN chown ${NB_USER}:${NB_GID} /tmp_home/jovyan/ComfyUI/comfyui-kubeflow-adapter.py
+# Copy our patched server.py directly
+COPY server.py /tmp_home/jovyan/ComfyUI/
+RUN chown ${NB_USER}:${NB_GID} /tmp_home/jovyan/ComfyUI/server.py
 
 # Remove the code-server service to prevent it from starting
 RUN rm -f /etc/services.d/code-server/run || true
