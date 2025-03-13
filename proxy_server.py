@@ -23,7 +23,7 @@ async def start_comfyui():
     )
     return process
 
-# Simple proxy to forward all requests
+# Simple proxy to forward all request
 async def proxy_handler(request):
     # Get the part of the path after the prefix
     path = request.path
@@ -44,29 +44,54 @@ async def proxy_handler(request):
     # Forward the request
     async with ClientSession() as session:
         method = request.method
-        headers = {key: value for key, value in request.headers.items() 
-                  if key.lower() not in ('host', 'content-length')}
+        
+        # Preserve more headers, including Origin, Referer, and cookies
+        headers = dict(request.headers)
+        
+        # Remove problematic headers
+        headers.pop('Host', None)
+        headers.pop('Content-Length', None)
+        
+        # Set a proper Referer for static assets if missing
+        if path.endswith(('.js', '.css', '.png', '.jpg', '.svg')) and 'Referer' not in headers:
+            headers['Referer'] = f'http://127.0.0.1:{COMFY_PORT}/'
+        
         data = await request.read() if method != 'GET' else None
         
         try:
-            async with session.request(method, target_url, headers=headers, data=data, allow_redirects=False) as resp:
-                # Create response
+            async with session.request(
+                method, 
+                target_url, 
+                headers=headers, 
+                data=data, 
+                allow_redirects=False,
+                cookies=request.cookies
+            ) as resp:
+                # Read the response body
+                body = await resp.read()
+                
+                # Create response with the same status code and body
                 response = web.Response(
                     status=resp.status,
-                    body=await resp.read(),
-                    content_type=resp.content_type
+                    body=body
                 )
                 
-                # Copy headers
+                # Copy content type and other headers
                 for key, value in resp.headers.items():
-                    if key.lower() not in ('content-length', 'content-encoding', 'transfer-encoding', 'server'):
+                    if key.lower() not in ('content-length', 'transfer-encoding'):
                         response.headers[key] = value
+                
+                # Debug output for 403 errors
+                if resp.status == 403:
+                    print(f"403 Error for {path}")
+                    print(f"Request headers: {headers}")
+                    print(f"Response headers: {resp.headers}")
                 
                 return response
         except Exception as e:
             print(f"Error proxying request: {e}")
             return web.Response(status=500, text=f"Proxy error: {str(e)}")
-
+            
 # WebSocket proxy handler
 async def websocket_proxy(request):
     from aiohttp import WSMsgType
