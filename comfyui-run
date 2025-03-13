@@ -2,5 +2,5 @@
 cd /home/jovyan/ComfyUI
 exec 2>&1
 
-# Run ComfyUI directly with port and CORS settings
-exec python main.py --listen 0.0.0.0 --port 8888 --enable-cors-header "*"
+# Run the proxy server
+exec python proxy_server.py
