@@ -48,30 +48,93 @@ async def proxy_handler(request):
                   if key.lower() not in ('host', 'content-length')}
         data = await request.read() if method != 'GET' else None
         
-        async with session.request(method, target_url, headers=headers, data=data) as resp:
-            # Create response
-            response = web.Response(
-                status=resp.status,
-                body=await resp.read(),
-                content_type=resp.content_type
-            )
-            
-            # Copy headers
-            for key, value in resp.headers.items():
-                if key.lower() not in ('content-length', 'content-encoding', 'transfer-encoding'):
-                    response.headers[key] = value
-            
-            return response
+        try:
+            async with session.request(method, target_url, headers=headers, data=data, allow_redirects=False) as resp:
+                # Create response
+                response = web.Response(
+                    status=resp.status,
+                    body=await resp.read(),
+                    content_type=resp.content_type
+                )
+                
+                # Copy headers
+                for key, value in resp.headers.items():
+                    if key.lower() not in ('content-length', 'content-encoding', 'transfer-encoding', 'server'):
+                        response.headers[key] = value
+                
+                return response
+        except Exception as e:
+            print(f"Error proxying request: {e}")
+            return web.Response(status=500, text=f"Proxy error: {str(e)}")
 
-# Add the catch-all route
+# WebSocket proxy handler
+async def websocket_proxy(request):
+    from aiohttp import WSMsgType
+    
+    # Create WebSocket connection to client
+    ws_client = web.WebSocketResponse()
+    await ws_client.prepare(request)
+    
+    # Get path for ComfyUI WebSocket
+    path = request.path
+    if path.startswith(NB_PREFIX):
+        path = path[len(NB_PREFIX):]
+    if not path.startswith('/'):
+        path = '/' + path
+    
+    # Connect to ComfyUI WebSocket
+    try:
+        async with ClientSession() as session:
+            ws_url = f"ws://127.0.0.1:{COMFY_PORT}{path}"
+            print(f"WebSocket connecting to: {ws_url}")
+            
+            async with session.ws_connect(ws_url) as ws_server:
+                print(f"WebSocket connected")
+                
+                # Create background task for server->client messages
+                async def forward_server_to_client():
+                    async for msg in ws_server:
+                        if msg.type == WSMsgType.TEXT:
+                            await ws_client.send_str(msg.data)
+                        elif msg.type == WSMsgType.BINARY:
+                            await ws_client.send_bytes(msg.data)
+                        elif msg.type == WSMsgType.CLOSED:
+                            break
+                
+                # Create task for the background forwarding
+                server_to_client = asyncio.create_task(forward_server_to_client())
+                
+                # Handle client->server messages
+                async for msg in ws_client:
+                    if msg.type == WSMsgType.TEXT:
+                        await ws_server.send_str(msg.data)
+                    elif msg.type == WSMsgType.BINARY:
+                        await ws_server.send_bytes(msg.data)
+                    elif msg.type == WSMsgType.CLOSED:
+                        break
+                
+                # Cancel the background task
+                server_to_client.cancel()
+                
+                return ws_client
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        if not ws_client.closed:
+            await ws_client.close()
+        return ws_client
+
+# Add routes
 app.router.add_routes([
-    web.route('*', '/{path:.*}', proxy_handler),
-    web.route('*', '/', proxy_handler)  # Handle the root path as well
+    web.get('/ws', websocket_proxy),  # Handle root WebSocket
+    web.get(NB_PREFIX + '/ws', websocket_proxy),  # Handle WebSocket with prefix
+    web.route('*', '/{path:.*}', proxy_handler),  # Handle everything else
+    web.route('*', '/', proxy_handler)  # Handle root path
 ])
 
 async def main():
     # Start ComfyUI
     process = await start_comfyui()
+    print("Started ComfyUI process")
     
     # Give ComfyUI a moment to start
     await asyncio.sleep(2)
