@@ -64,7 +64,10 @@ async def proxy_handler(request):
             return response
 
 # Add the catch-all route
-app.add_routes([web.route('*', '{path:.*}', proxy_handler)])
+app.router.add_routes([
+    web.route('*', '/{path:.*}', proxy_handler),
+    web.route('*', '/', proxy_handler)  # Handle the root path as well
+])
 
 async def main():
     # Start ComfyUI
