@@ -47,9 +47,12 @@ RUN pip install --pre torch torchvision torchaudio --index-url https://download.
 WORKDIR /tmp_home/jovyan/ComfyUI
 RUN pip install -r requirements.txt
 
-# Copy our patched server.py directly
-COPY server.py /tmp_home/jovyan/ComfyUI/
-RUN chown ${NB_USER}:${NB_GID} /tmp_home/jovyan/ComfyUI/server.py
+# Install additional packages for the proxy server
+RUN pip install aiohttp
+
+# Copy the proxy server script
+COPY proxy_server.py /tmp_home/jovyan/ComfyUI/
+RUN chown ${NB_USER}:${NB_GID} /tmp_home/jovyan/ComfyUI/proxy_server.py
 
 # Remove the code-server service to prevent it from starting
 RUN rm -f /etc/services.d/code-server/run || true
