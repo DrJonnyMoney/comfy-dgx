@@ -2,21 +2,35 @@ import os
 import sys
 import asyncio
 import subprocess
-from aiohttp import web, ClientSession
+import time
+import logging
+from aiohttp import web, ClientSession, WSMsgType
 
-# Get Kubeflow URL prefix
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("comfyui-proxy")
+
+# Configuration
 NB_PREFIX = os.environ.get('NB_PREFIX', '')
-print(f"Using Kubeflow prefix: {NB_PREFIX}")
-
-# The port ComfyUI will run on internally
 COMFY_PORT = 8188
+PROXY_PORT = 8888
+MAX_REQUEST_SIZE = 1024 * 1024 * 1024  # 1GB
+HTTP_TIMEOUT = 600  # 10 minutes
+STARTUP_TIMEOUT = 60  # Max seconds to wait for ComfyUI to start
+HEARTBEAT_INTERVAL = 30  # WebSocket heartbeat interval in seconds
 comfyui_process = None
 
-# Start ComfyUI as a subprocess with patched server
+# Common path normalization function
+def normalize_path(path):
+    """Normalize path by removing prefix and ensuring it starts with a slash"""
+    if path.startswith(NB_PREFIX):
+        path = path[len(NB_PREFIX):]
+    if not path.startswith('/'):
+        path = '/' + path
+    return path
+
+# Start ComfyUI as a subprocess
 def start_comfyui():
-    global comfyui_process
-    
-    # Start ComfyUI with appropriate arguments and increased timeout for large models
     cmd = [
         sys.executable, 
         "main.py", 
@@ -24,33 +38,34 @@ def start_comfyui():
         "--port", str(COMFY_PORT), 
         "--enable-cors-header", "*"
     ]
-    print(f"Starting ComfyUI with command: {' '.join(cmd)}")
-    
-    comfyui_process = subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
-    return comfyui_process
+    logger.info(f"Starting ComfyUI with command: {' '.join(cmd)}")
+    return subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
 
-# Simple proxy to forward all requests with increased timeouts
+# Check if ComfyUI is responding
+async def is_comfyui_ready():
+    """Check if ComfyUI is up and responding to requests"""
+    try:
+        async with ClientSession() as session:
+            async with session.get(f'http://127.0.0.1:{COMFY_PORT}/', timeout=2) as resp:
+                return resp.status < 500
+    except:
+        return False
+
+# Proxy handler for HTTP requests
 async def proxy_handler(request):
-    # Get the part of the path after the prefix
-    path = request.path
-    if path.startswith(NB_PREFIX):
-        path = path[len(NB_PREFIX):]
-    if not path.startswith('/'):
-        path = '/' + path
-        
+    # Normalize the path
+    path = normalize_path(request.path)
     target_url = f'http://127.0.0.1:{COMFY_PORT}{path}'
     
-    # Get query parameters
+    # Add query parameters if present
     params = request.rel_url.query
     if params:
         target_url += '?' + '&'.join(f"{k}={v}" for k, v in params.items())
     
-    print(f"Proxying: {request.method} {request.path} -> {target_url}")
+    logger.debug(f"Proxying: {request.method} {request.path} -> {target_url}")
     
-    # Forward the request with increased timeout
+    # Forward the request
     async with ClientSession() as session:
-        method = request.method
-        
         # Copy headers but set the Host to match what ComfyUI expects
         headers = dict(request.headers)
         headers['Host'] = f'127.0.0.1:{COMFY_PORT}'
@@ -58,19 +73,20 @@ async def proxy_handler(request):
         # Remove headers that might cause issues
         headers.pop('Content-Length', None)
         
-        data = await request.read() if method != 'GET' else None
+        # Read request data if not a GET request
+        data = await request.read() if request.method != 'GET' else None
         
         try:
             async with session.request(
-                method, 
+                request.method, 
                 target_url, 
                 headers=headers, 
                 data=data, 
                 allow_redirects=False,
                 cookies=request.cookies,
-                timeout=600  # 10 minute timeout for large model operations
+                timeout=HTTP_TIMEOUT
             ) as resp:
-                # Read the response body with a large timeout
+                # Read the response body
                 body = await resp.read()
                 
                 # Create response with the same status code and body
@@ -79,7 +95,7 @@ async def proxy_handler(request):
                     body=body
                 )
                 
-                # Copy content type and other headers
+                # Copy relevant headers from the response
                 for key, value in resp.headers.items():
                     if key.lower() not in ('content-length', 'transfer-encoding'):
                         response.headers[key] = value
@@ -87,42 +103,42 @@ async def proxy_handler(request):
                 return response
         except Exception as e:
             error_msg = f"Proxy error: {str(e)}"
-            print(error_msg)
+            logger.error(error_msg)
             
-            # Check content-type of the original request
-            accept_header = request.headers.get('Accept', '')
-            
-            # If the client expects JSON, return JSON error
-            if 'application/json' in accept_header:
+            # Return appropriate error response based on Accept header
+            if 'application/json' in request.headers.get('Accept', ''):
                 return web.json_response({"error": error_msg}, status=500)
             else:
-                # Otherwise return plain text
                 return web.Response(status=500, text=error_msg)
 
-# WebSocket proxy handler with increased timeout
+# WebSocket proxy handler
 async def websocket_proxy(request):
-    from aiohttp import WSMsgType
+    # Normalize the path
+    ws_path = normalize_path(request.path)
+    ws_url = f"ws://127.0.0.1:{COMFY_PORT}{ws_path}"
     
-    ws_path = request.path
-    if ws_path.startswith(NB_PREFIX):
-        ws_path = ws_path[len(NB_PREFIX):]
-    if not ws_path.startswith('/'):
-        ws_path = '/' + ws_path
+    logger.debug(f"WebSocket request: {request.path} -> {ws_url}")
     
-    print(f"WebSocket request: {request.path} -> {ws_path}")
-    
-    ws_client = web.WebSocketResponse(heartbeat=30)  # Add heartbeat to keep connection alive
+    # Prepare client WebSocket
+    ws_client = web.WebSocketResponse(heartbeat=HEARTBEAT_INTERVAL)
     await ws_client.prepare(request)
+    
+    # Two tasks for bidirectional communication
+    client_to_server_task = None
+    server_to_client_task = None
     
     try:
         async with ClientSession() as session:
-            ws_url = f"ws://127.0.0.1:{COMFY_PORT}{ws_path}"
-            print(f"Connecting to WebSocket: {ws_url}")
+            logger.debug(f"Connecting to WebSocket: {ws_url}")
             
-            async with session.ws_connect(ws_url, timeout=60, heartbeat=30) as ws_server:  # Increased timeout and heartbeat
-                print("WebSocket connected")
+            async with session.ws_connect(
+                ws_url, 
+                timeout=60, 
+                heartbeat=HEARTBEAT_INTERVAL
+            ) as ws_server:
+                logger.debug("WebSocket connected")
                 
-                # Forward messages in both directions
+                # Server to client message forwarding
                 async def forward_server_to_client():
                     try:
                         async for msg in ws_server:
@@ -130,50 +146,64 @@ async def websocket_proxy(request):
                                 await ws_client.send_str(msg.data)
                             elif msg.type == WSMsgType.BINARY:
                                 await ws_client.send_bytes(msg.data)
-                            elif msg.type == WSMsgType.ERROR:
-                                print(f"WebSocket error: {ws_server.exception()}")
+                            elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
                                 break
                     except Exception as e:
-                        print(f"Error forwarding server to client: {e}")
-                        if not ws_client.closed:
-                            await ws_client.close()
+                        logger.error(f"Error forwarding server to client: {e}")
                 
-                # Create task for server->client forwarding
-                server_to_client = asyncio.create_task(forward_server_to_client())
+                # Client to server message forwarding
+                async def forward_client_to_server():
+                    try:
+                        async for msg in ws_client:
+                            if msg.type == WSMsgType.TEXT:
+                                await ws_server.send_str(msg.data)
+                            elif msg.type == WSMsgType.BINARY:
+                                await ws_server.send_bytes(msg.data)
+                            elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
+                                break
+                    except Exception as e:
+                        logger.error(f"Error forwarding client to server: {e}")
                 
-                # Forward client->server
-                try:
-                    async for msg in ws_client:
-                        if msg.type == WSMsgType.TEXT:
-                            await ws_server.send_str(msg.data)
-                        elif msg.type == WSMsgType.BINARY:
-                            await ws_server.send_bytes(msg.data)
-                        elif msg.type == WSMsgType.ERROR:
-                            print(f"WebSocket error: {ws_client.exception()}")
-                            break
-                except Exception as e:
-                    print(f"Error forwarding client to server: {e}")
-                    if not ws_server.closed:
-                        await ws_server.close()
-                finally:
-                    # Cancel forwarding task
-                    server_to_client.cancel()
+                # Start both forwarding tasks
+                server_to_client_task = asyncio.create_task(forward_server_to_client())
+                client_to_server_task = asyncio.create_task(forward_client_to_server())
                 
-                return ws_client
+                # Wait until either task completes (meaning a connection closed)
+                done, pending = await asyncio.wait(
+                    [server_to_client_task, client_to_server_task],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                # Cancel the pending task
+                for task in pending:
+                    task.cancel()
+                
     except Exception as e:
-        print(f"WebSocket proxy error: {e}")
+        logger.error(f"WebSocket proxy error: {e}")
+    finally:
+        # Clean up tasks if they exist and weren't already cancelled
+        for task in [client_to_server_task, server_to_client_task]:
+            if task and not task.done():
+                task.cancel()
+        
+        # Make sure the client WebSocket is closed
         if not ws_client.closed:
             await ws_client.close()
-        return ws_client
+    
+    return ws_client
 
-# Create web app with routes
-app = web.Application(client_max_size=1024*1024*1024)  # 1GB max request size
-app.router.add_routes([
-    web.get(NB_PREFIX + '/ws', websocket_proxy),
-    web.get('/ws', websocket_proxy),
-    web.route('*', '/{path:.*}', proxy_handler),
-    web.route('*', '/', proxy_handler)
-])
+# Monitor ComfyUI health and restart if needed
+async def health_monitor():
+    global comfyui_process
+    
+    while True:
+        # Check if process is still running
+        if comfyui_process.poll() is not None:
+            logger.warning("ComfyUI process died, restarting...")
+            comfyui_process = start_comfyui()
+        
+        # Sleep for 30 seconds between checks
+        await asyncio.sleep(30)
 
 async def main():
     global comfyui_process
@@ -181,29 +211,65 @@ async def main():
     # Start ComfyUI
     comfyui_process = start_comfyui()
     
-    # Give ComfyUI time to start
-    print("Waiting for ComfyUI to start...")
-    await asyncio.sleep(30)  # Increased wait time for large models
+    # Wait for ComfyUI to start by polling
+    logger.info("Waiting for ComfyUI to start...")
+    start_time = time.time()
+    while not await is_comfyui_ready():
+        if time.time() - start_time > STARTUP_TIMEOUT:
+            logger.error(f"ComfyUI failed to start within {STARTUP_TIMEOUT} seconds")
+            comfyui_process.terminate()
+            sys.exit(1)
+        await asyncio.sleep(1)
     
-    # Start our proxy server
+    logger.info("ComfyUI started successfully")
+    
+    # Create and start health monitor
+    health_task = asyncio.create_task(health_monitor())
+    
+    # Create app with routes
+    app = web.Application(client_max_size=MAX_REQUEST_SIZE)
+    
+    # Set up routes - only need one of each with catch-all patterns
+    app.router.add_routes([
+        web.get(NB_PREFIX + '/ws', websocket_proxy),
+        web.get('/ws', websocket_proxy),
+        web.route('*', '/{path:.*}', proxy_handler),
+    ])
+    
+    # Start the proxy server
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 8888)
+    site = web.TCPSite(runner, '0.0.0.0', PROXY_PORT)
     await site.start()
     
-    print(f"Proxy server running at http://0.0.0.0:8888{NB_PREFIX}/")
+    logger.info(f"Proxy server running at http://0.0.0.0:{PROXY_PORT}{NB_PREFIX}/")
     
-    # Keep running
+    # Keep running until interrupted
     try:
         while True:
             await asyncio.sleep(3600)
     except (KeyboardInterrupt, asyncio.CancelledError):
-        print("Shutting down...")
+        logger.info("Shutting down...")
     finally:
+        # Clean up
+        health_task.cancel()
+        
         if comfyui_process:
             comfyui_process.terminate()
-            print("ComfyUI process terminated")
+            try:
+                # Wait for process to terminate gracefully
+                comfyui_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # Force kill if it doesn't terminate in time
+                comfyui_process.kill()
+            
+            logger.info("ComfyUI process terminated")
+        
+        # Clean up the web server
+        await runner.cleanup()
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user, shutting down")
