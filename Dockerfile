@@ -62,7 +62,7 @@ RUN pip install --pre torch torchvision torchaudio --index-url https://download.
 WORKDIR /tmp_home/jovyan/ComfyUI
 RUN pip install -r requirements.txt
 # Install additional packages for the proxy server
-RUN pip install aiohttp opencv-python imageio-ffmpeg
+RUN pip install aiohttp opencv-python imageio-ffmpeg lpips
 # Copy the proxy server script
 COPY proxy_server.py /tmp_home/jovyan/ComfyUI/
 RUN chown ${NB_USER}:${NB_GID} /tmp_home/jovyan/ComfyUI/proxy_server.py
