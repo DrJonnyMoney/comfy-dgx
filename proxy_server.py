@@ -12,52 +12,9 @@ print(f"Using Kubeflow prefix: {NB_PREFIX}")
 COMFY_PORT = 8188
 comfyui_process = None
 
-# Create a modified version of server.py to disable the host/origin check
-def patch_comfyui_server():
-    server_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.py")
-    backup_path = server_path + ".backup"
-    
-    # Create backup if it doesn't exist
-    if not os.path.exists(backup_path):
-        import shutil
-        shutil.copy2(server_path, backup_path)
-        print("Created backup of server.py")
-    
-    # Read the file line by line to preserve indentation
-    with open(backup_path, 'r') as f:
-        lines = f.readlines()
-    
-    patched_lines = []
-    patched = False
-    for line in lines:
-        # Check if this is the line with the security check
-        if "if host_domain != origin_domain:" in line:
-            # Calculate indentation (number of spaces)
-            indentation = len(line) - len(line.lstrip())
-            # Create the new line with the same indentation
-            new_line = ' ' * indentation + "if False:  # Disabled by Kubeflow proxy - original: host_domain != origin_domain\n"
-            patched_lines.append(new_line)
-            patched = True
-        else:
-            patched_lines.append(line)
-    
-    # Write the patched content back to the file
-    with open(server_path, 'w') as f:
-        f.writelines(patched_lines)
-    
-    if patched:
-        print("Patched server.py to disable host/origin security check")
-    else:
-        print("Warning: Could not find security check line in server.py")
-    
-    return patched
-
 # Start ComfyUI as a subprocess with patched server
 def start_comfyui():
     global comfyui_process
-    
-    # Patch server.py to disable the security check
-    patch_comfyui_server()
     
     # Start ComfyUI with appropriate arguments and increased timeout for large models
     cmd = [
